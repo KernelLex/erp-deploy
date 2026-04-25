@@ -1,0 +1,192 @@
+version: "3"
+
+# All ERPNext services (backend, workers, scheduler) run from the same custom image.
+# The React frontend is served separately on port 3000.
+# ERPNext desk is available on port 8080.
+
+x-backend-defaults: &backend-defaults
+  image: erp-custom:latest
+  restart: unless-stopped
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+  networks:
+    - erp-net
+
+services:
+  # ─── One-time: write bench config ────────────────────────────────────────────
+  configurator:
+    <<: *backend-defaults
+    restart: "no"
+    entrypoint: bash -c
+    command:
+      - >
+        bench set-config -g db_host $$DB_HOST;
+        bench set-config -gp db_port $$DB_PORT;
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+        bench set-config -gp socketio_port 9000;
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+
+  # ─── One-time: create site + install apps ────────────────────────────────────
+  create-site:
+    <<: *backend-defaults
+    restart: "no"
+    entrypoint: bash -c
+    command:
+      - >
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        export start=`date +%s`;
+        until [[ -n `grep -hs ^ sites/common_site_config.json | python3 -c "import sys,json; cfg=json.load(sys.stdin); print(cfg.get('db_host',''))"` ]]; do
+          echo "Waiting for configurator..."; sleep 4;
+          now=`date +%s`; if (( now - start > 120 )); then exit 1; fi;
+        done;
+        echo "Creating site ${SITE_NAME}...";
+        bench new-site --no-mariadb-socket \
+          --db-root-password=${DB_ROOT_PASSWORD} \
+          --admin-password=${ADMIN_PASSWORD} \
+          --set-default ${SITE_NAME};
+        bench --site ${SITE_NAME} install-app erpnext;
+        bench --site ${SITE_NAME} install-app hrms;
+        bench --site ${SITE_NAME} install-app hr_client;
+        echo "Site ready!";
+    environment:
+      SITE_NAME: ${SITE_NAME}
+      DB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  # ─── Main app (gunicorn) ─────────────────────────────────────────────────────
+  backend:
+    <<: *backend-defaults
+    command: bench serve --port 8000
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+
+  # ─── WebSocket (Socket.IO) ───────────────────────────────────────────────────
+  websocket:
+    <<: *backend-defaults
+    command: node /home/frappe/frappe-bench/apps/frappe/socketio.js
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+
+  # ─── Scheduler ───────────────────────────────────────────────────────────────
+  scheduler:
+    <<: *backend-defaults
+    command: bench schedule
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+
+  # ─── Workers ─────────────────────────────────────────────────────────────────
+  worker-short:
+    <<: *backend-defaults
+    command: bench worker --queue short,default
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+
+  worker-long:
+    <<: *backend-defaults
+    command: bench worker --queue long,default,short
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+
+  # ─── nginx reverse proxy for ERPNext desk ────────────────────────────────────
+  frontend:
+    <<: *backend-defaults
+    command: nginx-entrypoint.sh
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${SITE_NAME}
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: 120
+      CLIENT_MAX_BODY_SIZE: 50m
+    ports:
+      - "8080:8080"
+    depends_on:
+      backend:
+        condition: service_started
+      websocket:
+        condition: service_started
+
+  # ─── React HR Frontend ────────────────────────────────────────────────────────
+  hr-frontend:
+    build:
+      context: ./hr-frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: http://${SERVER_IP}:8080
+        VITE_USE_MOCK: "false"
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    networks:
+      - erp-net
+    depends_on:
+      - frontend
+
+  # ─── MariaDB ─────────────────────────────────────────────────────────────────
+  db:
+    image: mariadb:10.6
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    volumes:
+      - db-data:/var/lib/mysql
+    networks:
+      - erp-net
+    healthcheck:
+      test: mysqladmin ping -h localhost --password=${DB_ROOT_PASSWORD}
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─── Redis ───────────────────────────────────────────────────────────────────
+  redis-cache:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    networks:
+      - erp-net
+
+  redis-queue:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    networks:
+      - erp-net
+
+volumes:
+  sites:
+  logs:
+  db-data:
+
+networks:
+  erp-net:
+    driver: bridge
