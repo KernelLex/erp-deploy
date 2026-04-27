@@ -1,145 +1,121 @@
-# ClientERP — Deploy
+# ClientERP — Deploy (Ubuntu, no Docker)
 
-Runs the full ERP stack on any Ubuntu server:
-- **ERPNext v15 + HRMS + hr_client** (custom app) → `http://YOUR_IP:8080`
-- **React HR Frontend** → `http://YOUR_IP:3000`
+Deploys the full ERP stack directly on Ubuntu 22.04 / 24.04:
 
-Everything runs in Docker. No manual ERPNext install needed.
+| What | Where |
+|---|---|
+| **ERPNext 15 + HRMS + hr_client** | `http://SITE_NAME` (nginx → gunicorn) |
+| **React HR Frontend** | `http://FRONTEND_DOMAIN` (nginx static) |
 
----
-
-## What's inside
-
-| Service | What it does | Port |
-|---|---|---|
-| `frontend` | ERPNext desk (nginx proxy) | 8080 |
-| `backend` | Frappe/ERPNext app server | internal |
-| `websocket` | Real-time updates | internal |
-| `scheduler` | Cron jobs | internal |
-| `worker-short/long` | Background jobs | internal |
-| `db` | MariaDB 10.6 | internal |
-| `redis-cache/queue` | Redis | internal |
-| `hr-frontend` | React app (nginx) | 3000 |
+No Docker. Bench manages processes via Supervisor.
 
 ---
 
-## Step 1 — Prepare your Ubuntu server
+## Prerequisites on the server
 
-SSH into your server, then run:
+- Fresh Ubuntu 22.04 or 24.04 (root or sudo access)
+- A domain or IP for each of `SITE_NAME` and `FRONTEND_DOMAIN`  
+  (can be the same machine, different subdomains)
+- Outbound internet (to pull apps from GitHub)
+
+---
+
+## Step 1 — Clone the deploy repo
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KernelLex/erp-deploy/main/scripts/install-docker.sh | bash
-
-# IMPORTANT: log out and back in so docker group takes effect
-exit
-# SSH back in, then verify:
-docker --version
-docker compose version
+sudo apt update && sudo apt install -y git
+git clone https://github.com/KernelLex/erp-deploy.git ~/erp-deploy
+cd ~/erp-deploy
 ```
 
 ---
 
-## Step 2 — Clone this repo on the server
-
-```bash
-git clone https://github.com/KernelLex/erp-deploy.git
-cd erp-deploy
-```
-
----
-
-## Step 3 — Configure your .env
+## Step 2 — Configure .env
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Fill in:
+Fill in all values:
 
 ```env
-SERVER_IP=192.168.1.100        # your server's actual IP
-SITE_NAME=erp.localhost
+SITE_NAME=erp.yourdomain.com       # ERPNext desk domain
+FRONTEND_DOMAIN=app.yourdomain.com  # React app domain
 DB_ROOT_PASSWORD=StrongPass1!
 ADMIN_PASSWORD=StrongPass2!
+HR_CLIENT_REPO=https://github.com/KernelLex/hr-client-erp.git
 ```
 
 ---
 
-## Step 4 — Build and start
+## Step 3 — Run the installer
 
 ```bash
-bash scripts/build-and-start.sh
+sudo bash scripts/install.sh
 ```
 
-This will:
-1. Build the custom Docker image (ERPNext + HRMS + hr_client) — **takes 5–15 min first time**
-2. Start all services
-3. Create the ERPNext site automatically
-4. Install all apps
+This single script (~15-25 min on first run):
 
-Watch progress:
-```bash
-docker compose logs -f create-site
-```
+1. Installs system packages (mariadb, redis, nginx, supervisor, node 18, python3.10, wkhtmltopdf)
+2. Creates a `frappe` system user
+3. Initialises bench with frappe v15
+4. Pulls erpnext, hrms, hr_client
+5. Creates the ERPNext site and runs migrations
+6. Runs `bench setup production` → configures Supervisor + nginx for ERPNext
+7. Builds the React frontend and deploys it to `/var/www/hr-frontend`
+8. Adds a separate nginx vhost for the frontend
 
 ---
 
-## Step 5 — Access the system
+## Step 4 — Access the system
 
 | URL | What |
 |---|---|
-| `http://YOUR_IP:8080` | ERPNext Desk — login: Administrator / your ADMIN_PASSWORD |
-| `http://YOUR_IP:3000` | React HR Frontend |
+| `http://SITE_NAME` | ERPNext Desk — login: `Administrator` / your `ADMIN_PASSWORD` |
+| `http://FRONTEND_DOMAIN` | React HR Frontend |
 
 ---
 
 ## Updating after code changes
 
+Push your changes to GitHub, then on the server:
+
 ```bash
-cd erp-deploy
-bash scripts/update.sh
+sudo bash ~/erp-deploy/scripts/update.sh
+# Skip frontend rebuild:
+sudo bash ~/erp-deploy/scripts/update.sh --skip-frontend
 ```
 
 ---
 
-## Common commands
+## Common bench commands
+
+All bench commands run as the `frappe` user:
 
 ```bash
-# View running services
-docker compose ps
+sudo -u frappe bash -c "cd ~/frappe-bench && bench --site erp.yourdomain.com migrate"
+sudo -u frappe bash -c "cd ~/frappe-bench && bench --site erp.yourdomain.com clear-cache"
+sudo -u frappe bash -c "cd ~/frappe-bench && bench --site erp.yourdomain.com console"
 
 # View logs
-docker compose logs -f backend
-docker compose logs -f hr-frontend
+sudo tail -f /home/frappe/frappe-bench/logs/worker.log
+sudo tail -f /home/frappe/frappe-bench/logs/web.error.log
 
-# Run bench commands inside the container
-docker compose exec backend bench --site erp.localhost migrate
-docker compose exec backend bench --site erp.localhost clear-cache
-docker compose exec backend bench --site erp.localhost console
-
-# Stop everything
-docker compose down
-
-# Stop and wipe all data (DESTRUCTIVE)
-docker compose down -v
+# Restart workers
+sudo supervisorctl restart all
 ```
 
 ---
 
-## Troubleshooting
+## Optional: HTTPS with Let's Encrypt
 
-**`create-site` keeps waiting**
-→ `docker compose logs configurator` — usually a DB connection issue. Check DB_ROOT_PASSWORD in .env.
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d erp.yourdomain.com -d app.yourdomain.com
+```
 
-**Port 8080 or 3000 already in use**
-→ Change the port in compose.yml: `"8081:8080"`.
-
-**Frontend shows "Network Error"**
-→ SERVER_IP in .env must match your actual server IP. Rebuild: `docker compose build hr-frontend && docker compose up -d hr-frontend`.
-
-**Site already exists on restart**
-→ `create-site` is one-time. On repeat `docker compose up` it will error harmlessly. If it blocks, drop and recreate: `docker compose exec backend bench drop-site erp.localhost --force`.
+Certbot auto-renews via a systemd timer.
 
 ---
 
@@ -148,11 +124,28 @@ docker compose down -v
 ```
 Internet
    │
-   ├─ :8080 ─▶ frontend (nginx) ─▶ backend (gunicorn :8000)
-   │                              ├─▶ websocket (node :9000)
-   │                              └─▶ db (mariadb) + redis
+   ├─ :80/443 ─▶ nginx [erp.yourdomain.com]
+   │                  └─▶ gunicorn :8000  (frappe/ERPNext)
+   │                  └─▶ node    :9000  (socketio)
    │
-   └─ :3000 ─▶ hr-frontend (nginx, React SPA)
-                      │
-                      └─▶ API calls to :8080/api/...
+   └─ :80/443 ─▶ nginx [app.yourdomain.com]  (static React SPA)
+                       └─▶ /api/* proxied to gunicorn :8000
 ```
+
+Supervisor manages: gunicorn, socketio, redis-cache, redis-queue, bench workers, scheduler.
+
+---
+
+## Troubleshooting
+
+**`bench new-site` fails with DB auth error**
+→ Check `DB_ROOT_PASSWORD` in `.env`. Verify with: `mysql -u root -p`
+
+**nginx config test fails**
+→ `sudo nginx -t` — check for conflicting server_name blocks.
+
+**Workers not starting**
+→ `sudo supervisorctl status` — look for `FATAL`. Check `/home/frappe/frappe-bench/logs/`.
+
+**Frontend API calls fail (CORS / 502)**
+→ The `/api/` proxy in the frontend vhost points to `127.0.0.1:8000`. Verify gunicorn is running: `sudo supervisorctl status frappe-bench-frappe-web:`.
